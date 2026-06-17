@@ -1,0 +1,35 @@
+[project]
+name = "pages-counter"
+version = "0.1.0"
+description = "Count pages in PDFs inside compressed tar archives without extracting to disk."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "customtkinter>=5.2.0",
+    "pymupdf>=1.25.0",
+    "tqdm>=4.67.0",
+    "zstandard>=0.25.0",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.22.0",
+    "bandit>=1.9.0",
+    "ruff>=0.15.0",
+    "nuitka>=4.1.2",
+    "pyinstaller>=6.21.0",
+]
+
+[tool.basedpyright]
+typeCheckingMode = "off"
+reportAny = "none"
+reportExplicitAny = "warning"
+reportMissingTypeStubs = "none"
+reportUnknownMemberType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownVariableType = "none"
+reportUnknownParameterType = "none"
+reportUnknownLambdaType = "none"
+reportUnusedCallResult = "none"
+reportUnannotatedClassAttribute = "warning"
+reportImplicitStringConcatenation = "warning"
