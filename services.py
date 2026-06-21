@@ -36,6 +36,7 @@ class FileResult:
     file_path: str
     total_pages: int
     pdf_count: int
+    detail_lines: tuple[str, ...] = ()
 
 
 @dataclass
@@ -68,15 +69,13 @@ def _count_pdf_from_stream(file_obj: IO[bytes]) -> int:
         tmp = NamedTemporaryFile(suffix=".pdf", delete=False)
         try:
             _stream_to_file(file_obj, tmp)
+            tmp.close()  # must close before fitz.open — Windows holds an exclusive lock
             doc = fitz.open(tmp.name)  # type: ignore[union-attr]
-            if doc is None:
-                return 0
             try:
                 return doc.page_count
             finally:
                 doc.close()  # type: ignore[union-attr]
         finally:
-            tmp.close()
             _remove_temp(tmp.name)
     except Exception:
         return 0
@@ -109,10 +108,7 @@ def verify_pymupdf() -> None:
     _ = fitz.open
 
 
-def process_archive(
-    archive_path: str,
-    details_file_path: str | None = None,
-) -> FileResult:
+def process_archive(archive_path: str) -> FileResult:
     """Process a single .tar.zst archive.
 
     Streams zstd decompression + tar iteration — never loads the full
@@ -123,23 +119,18 @@ def process_archive(
 
     Args:
         archive_path: Path to the .tar.zst file on disk.
-        details_file_path: If provided, append per-PDF details to this file.
 
     Returns:
-        FileResult with page count and PDF count.
+        FileResult with page count, PDF count, and per-PDF detail lines.
+        Callers should write detail_lines to a file in the coordinating
+        process to avoid concurrent-write races across pool workers.
     """
     # Lazy import to avoid multiprocessing pickle errors.
     import zstandard as zstd
 
     total_pages: int = 0
     pdf_count: int = 0
-
-    details_fh: IO[str] | None = None
-    if details_file_path is not None:
-        details_fh = open(details_file_path, "a", encoding="utf-8")
-
     detail_lines: list[str] = []
-    flush_threshold = 500
 
     try:
         with open(archive_path, "rb") as compressed_file:
@@ -151,72 +142,54 @@ def process_archive(
                             file_obj = tar.extractfile(member)
                             if file_obj is not None:
                                 page_count = _count_pdf_from_stream(file_obj)
-
                                 if page_count > 0:
-                                    if details_fh is not None:
-                                        detail_lines.append(
-                                            f"  {member.name}: {page_count} pages\n"
-                                        )
+                                    detail_lines.append(
+                                        f"  {member.name}: {page_count} pages\n"
+                                    )
                                     total_pages += page_count
                                     pdf_count += 1
 
-                                    if len(detail_lines) >= flush_threshold:
-                                        if details_fh is not None:
-                                            details_fh.writelines(detail_lines)
-                                        detail_lines.clear()
-
     except Exception as e:
         print(f"[ERROR] Failed to process {archive_path}: {e}", file=sys.stderr)
-    finally:
-        if detail_lines and details_fh is not None:
-            details_fh.writelines(detail_lines)
-        if details_fh is not None:
-            details_fh.close()
 
     return FileResult(
         file_path=archive_path,
         total_pages=total_pages,
         pdf_count=pdf_count,
+        detail_lines=tuple(detail_lines),
     )
 
 
-def process_pdf(
-    pdf_path: str,
-    details_file_path: str | None = None,
-) -> FileResult:
+def process_pdf(pdf_path: str) -> FileResult:
     """Count pages in a single loose PDF file.
 
     Args:
         pdf_path: Path to the .pdf file on disk.
-        details_file_path: If provided, append per-PDF details to this file.
 
     Returns:
-        FileResult with page count.
+        FileResult with page count and a per-PDF detail line.
+        Callers should write detail_lines to a file in the coordinating
+        process to avoid concurrent-write races across pool workers.
     """
     page_count: int = 0
     try:
         doc = fitz.open(pdf_path)  # type: ignore[union-attr]
-        if doc is None:
-            return FileResult(
-                file_path=pdf_path,
-                total_pages=0,
-                pdf_count=0,
-            )
         try:
             page_count = doc.page_count
         finally:
             doc.close()  # type: ignore[union-attr]
     except Exception as e:
-        print(f"  [WARN] Could not parse PDF: {pdf_path} ({e})")
+        print(f"  [WARN] Could not parse PDF: {pdf_path} ({e})", file=sys.stderr)
 
-    if page_count > 0 and details_file_path is not None:
-        with open(details_file_path, "a", encoding="utf-8") as f:
-            f.write(f"  {pdf_path}: {page_count} pages\n")
+    detail_lines: tuple[str, ...] = ()
+    if page_count > 0:
+        detail_lines = (f"  {pdf_path}: {page_count} pages\n",)
 
     return FileResult(
         file_path=pdf_path,
         total_pages=page_count,
         pdf_count=1 if page_count > 0 else 0,
+        detail_lines=detail_lines,
     )
 
 

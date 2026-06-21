@@ -8,12 +8,13 @@ All core logic is delegated to services.py.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import multiprocessing
 import os
 import sys
 import time
 from dataclasses import dataclass
-from functools import partial
+from typing import Callable
 
 from tqdm import tqdm
 
@@ -21,7 +22,6 @@ from services import (
     FileResult,
     ProcessingMode,
     find_files,
-    init_details_file,
     process_archive,
     process_pdf,
     verify_pymupdf,
@@ -91,11 +91,11 @@ Examples:
     )
 
 
-def _select_worker(mode: ProcessingMode, details_file_path: str | None):
+def _select_worker(mode: ProcessingMode) -> Callable[[str], FileResult]:
     """Return the appropriate worker function for the given mode."""
     if mode == "archive":
-        return partial(process_archive, details_file_path=details_file_path)
-    return partial(process_pdf, details_file_path=details_file_path)
+        return process_archive
+    return process_pdf
 
 
 def _print_result(
@@ -142,7 +142,18 @@ def run(argv: list[str] | None = None) -> None:
         print(f"ERROR: pymupdf failed to initialize: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Validate jobs
+    num_workers = args.jobs if args.jobs is not None else multiprocessing.cpu_count()
+    if num_workers < 1:
+        print(f"ERROR: --jobs must be at least 1, got {num_workers}", file=sys.stderr)
+        sys.exit(1)
+
     start_time = time.time()
+
+    # Validate directory
+    if not os.path.isdir(args.target_dir):
+        print(f"ERROR: Directory not found: {args.target_dir!r}", file=sys.stderr)
+        sys.exit(1)
 
     # Collect matching target files
     mode: ProcessingMode = args.mode  # type: ignore[assignment]
@@ -159,46 +170,49 @@ def run(argv: list[str] | None = None) -> None:
     else:
         print(f"Found {len(target_files)} PDFs. Spawning execution pool...")
 
-    num_workers = args.jobs or multiprocessing.cpu_count()
     print(f"Using {num_workers} worker(s).")
 
-    # Prepare details file
-    details_file_path: str | None = None
-    if args.details:
-        init_details_file(args.details)
-        details_file_path = args.details
-
-    # Select worker function based on mode
-    worker_func = _select_worker(mode, details_file_path)
+    worker_func = _select_worker(mode)
 
     # imap_unordered yields results as soon as each worker finishes
     chunksize = max(1, len(target_files) // (num_workers * 4))
-    with multiprocessing.Pool(processes=num_workers) as pool:
-        results_iter = pool.imap_unordered(
-            worker_func,
-            target_files,
-            chunksize=chunksize,
+
+    grand_total_pages = 0
+    grand_total_pdfs = 0
+
+    print()
+    print("=" * 60)
+    print("Execution Results")
+    print("=" * 60)
+
+    # Open details file once in the coordinator; workers return detail_lines
+    # in FileResult to avoid concurrent-write races across pool workers.
+    with contextlib.ExitStack() as stack:
+        details_fh = (
+            stack.enter_context(open(args.details, "w", encoding="utf-8"))
+            if args.details
+            else None
         )
+        with multiprocessing.Pool(processes=num_workers) as pool:
+            results_iter = pool.imap_unordered(
+                worker_func,
+                target_files,
+                chunksize=chunksize,
+            )
 
-        grand_total_pages = 0
-        grand_total_pdfs = 0
-
-        print()
-        print("=" * 60)
-        print("Execution Results")
-        print("=" * 60)
-
-        # tqdm progress bar wraps the iterator
-        for result in tqdm(
-            results_iter,
-            total=len(target_files),
-            desc="Files processed",
-            unit="file",
-            leave=False,
-        ):
-            _print_result(result, start_time)
-            grand_total_pages += result.total_pages
-            grand_total_pdfs += result.pdf_count
+            # tqdm progress bar wraps the iterator
+            for result in tqdm(
+                results_iter,
+                total=len(target_files),
+                desc="Files processed",
+                unit="file",
+                leave=False,
+            ):
+                _print_result(result, start_time)
+                grand_total_pages += result.total_pages
+                grand_total_pdfs += result.pdf_count
+                if details_fh is not None and result.detail_lines:
+                    details_fh.writelines(result.detail_lines)
 
     elapsed = time.time() - start_time
     _print_summary(len(target_files), grand_total_pdfs, grand_total_pages, elapsed)
@@ -213,4 +227,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Required for multiprocessing in frozen (PyInstaller) builds on Windows,
+    # where workers are spawned by re-running this executable.
+    multiprocessing.freeze_support()
     main()

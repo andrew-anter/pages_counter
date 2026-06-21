@@ -13,7 +13,7 @@ import queue
 import sys
 import threading
 import time
-from functools import partial
+from typing import IO
 
 
 from tkinter import filedialog, messagebox, ttk
@@ -24,7 +24,6 @@ from services import (
     FileResult,
     ProcessingMode,
     find_files,
-    init_details_file,
     process_archive,
     process_pdf,
     verify_pymupdf,
@@ -42,10 +41,10 @@ _MsgQueue = queue.Queue
 def _run_counting(
     files: list[str],
     num_workers: int,
-    details_file_path: str | None,
     msg_queue: _MsgQueue,
     stop_event: threading.Event,
     mode: ProcessingMode,
+    pool_ref: list,
 ) -> None:
     """Run the multiprocessing pool in a background thread.
 
@@ -56,30 +55,26 @@ def _run_counting(
       ("error", error_message: str)
     """
     try:
-        if mode == "archive":
-            worker_func = partial(
-                process_archive, details_file_path=details_file_path
-            )
-        else:
-            worker_func = partial(
-                process_pdf, details_file_path=details_file_path
-            )
-
+        worker_func = process_archive if mode == "archive" else process_pdf
         chunksize = max(1, len(files) // (num_workers * 4))
 
         with multiprocessing.Pool(processes=num_workers) as pool:
-            results_iter = pool.imap_unordered(
-                worker_func, files, chunksize=chunksize
-            )
+            pool_ref[0] = pool
+            try:
+                results_iter = pool.imap_unordered(
+                    worker_func, files, chunksize=chunksize
+                )
 
-            for result in results_iter:
-                if stop_event.is_set():
-                    pool.terminate()
-                    msg_queue.put(("finish", 0, True))
-                    return
-                msg_queue.put(("result", result))
+                for result in results_iter:
+                    if stop_event.is_set():
+                        pool.terminate()
+                        msg_queue.put(("finish", 0, True))
+                        return
+                    msg_queue.put(("result", result))
 
-            msg_queue.put(("finish", len(files), False))
+                msg_queue.put(("finish", len(files), False))
+            finally:
+                pool_ref[0] = None
     except Exception as e:
         msg_queue.put(("error", str(e)))
         msg_queue.put(("finish", 0, True))
@@ -113,6 +108,8 @@ class PagesCounterApp(ctk.CTk):
         self.worker_thread: threading.Thread | None = None
         self.start_time: float = 0.0
         self.details_file_path: str | None = None
+        self._details_fh: IO[str] | None = None  # open during a run
+        self._pool_ref: list = [None]  # holds the active Pool for _on_close cleanup
 
         # UI widget references
         self.subtitle_var: ctk.StringVar
@@ -139,6 +136,23 @@ class PagesCounterApp(ctk.CTk):
 
         self._build_ui()
         self._poll_queue()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ----- Lifecycle ----------------------------------------------------------
+
+    def _on_close(self) -> None:
+        """Terminate pool workers and close any open files before destroying."""
+        self.stop_event.set()
+        pool = self._pool_ref[0]
+        if pool is not None:
+            try:
+                pool.terminate()
+            except Exception:  # nosec B110 — best-effort cleanup on close
+                pass
+        if self._details_fh is not None:
+            self._details_fh.close()
+            self._details_fh = None
+        self.destroy()
 
     # ----- UI construction ------------------------------------------------
 
@@ -206,7 +220,7 @@ class PagesCounterApp(ctk.CTk):
         )
         self.source_label.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
-        btn_row = ctk.CTkFrame(src_frame)
+        btn_row = ctk.CTkFrame(src_frame, fg_color="transparent")
         btn_row.pack(side="right")
 
         self.btn_folder = ctk.CTkButton(
@@ -293,11 +307,11 @@ class PagesCounterApp(ctk.CTk):
 
         self.btn_start = ctk.CTkButton(
             act_frame,
-            text="\u25b6  Start Counting",
+            text="▶  Start Counting",
             width=160,
             height=34,
-            fg_color="green",
-            hover_color="darkgreen",
+            fg_color="#2fa572",
+            hover_color="#106a43",
             command=self._start_counting,
             font=ctk.CTkFont(size=13, weight="bold"),
         )
@@ -305,11 +319,11 @@ class PagesCounterApp(ctk.CTk):
 
         self.btn_stop = ctk.CTkButton(
             act_frame,
-            text="\u25a0  Stop",
+            text="■  Stop",
             width=100,
             height=34,
-            fg_color="red",
-            hover_color="darkred",
+            fg_color="#c0392b",
+            hover_color="#922b21",
             command=self._stop_counting,
             state="disabled",
             font=ctk.CTkFont(size=13, weight="bold"),
@@ -347,19 +361,24 @@ class PagesCounterApp(ctk.CTk):
         )
         results_frame.pack(fill="both", expand=True, pady=(8, 0))
 
+        self._style_treeview()
         self.results_tree = ttk.Treeview(
             results_frame,
             columns=("file", "pdfs", "pages", "time"),
             show="headings",
+            style="Pages.Treeview",
         )
         self.results_tree.heading("file", text="File")
-        self.results_tree.heading("pdfs", text="PDFs")
-        self.results_tree.heading("pages", text="Pages")
-        self.results_tree.heading("time", text="Time")
+        self.results_tree.heading("pdfs", text="PDFs", anchor="e")
+        self.results_tree.heading("pages", text="Pages", anchor="e")
+        self.results_tree.heading("time", text="Time", anchor="e")
         self.results_tree.column("file", width=400, minwidth=200)
-        self.results_tree.column("pdfs", width=80, minwidth=50)
-        self.results_tree.column("pages", width=80, minwidth=50)
-        self.results_tree.column("time", width=80, minwidth=50)
+        self.results_tree.column("pdfs", width=80, minwidth=50, anchor="e")
+        self.results_tree.column("pages", width=80, minwidth=50, anchor="e")
+        self.results_tree.column("time", width=80, minwidth=50, anchor="e")
+        # Alternating row colors for readability
+        self.results_tree.tag_configure("oddrow", background="#242424")
+        self.results_tree.tag_configure("evenrow", background="#2b2b2b")
         self.results_tree.pack(fill="both", expand=True, padx=4, pady=4)
 
         # --- Summary bar ---
@@ -370,6 +389,41 @@ class PagesCounterApp(ctk.CTk):
             font=ctk.CTkFont(size=12, weight="bold"),
             anchor="w",
         ).pack(fill="x", pady=(8, 0))
+
+    def _style_treeview(self) -> None:
+        """Restyle the ttk.Treeview to match the dark CustomTkinter theme.
+
+        ttk widgets don't honor CustomTkinter theming, so without this the
+        results table renders as a stark light-mode table inside a dark app.
+        """
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure(
+            "Pages.Treeview",
+            background="#2b2b2b",
+            foreground="#dce4ee",
+            fieldbackground="#2b2b2b",
+            borderwidth=0,
+            rowheight=28,
+            font=("", 11),
+        )
+        style.configure(
+            "Pages.Treeview.Heading",
+            background="#1f6aa5",
+            foreground="white",
+            relief="flat",
+            font=("", 11, "bold"),
+            padding=(6, 6),
+        )
+        style.map(
+            "Pages.Treeview.Heading",
+            background=[("active", "#144870")],
+        )
+        style.map(
+            "Pages.Treeview",
+            background=[("selected", "#1f6aa5")],
+            foreground=[("selected", "white")],
+        )
 
     # ----- Mode switching -------------------------------------------------
 
@@ -457,11 +511,48 @@ class PagesCounterApp(ctk.CTk):
             )
             return
 
+        # Validate workers before committing to running state
+        try:
+            num_workers = self.workers_var.get()
+        except Exception:
+            messagebox.showerror(
+                "Invalid workers",
+                "Workers must be a positive integer.",
+            )
+            return
+        if num_workers < 1:
+            messagebox.showerror(
+                "Invalid workers",
+                f"Workers must be at least 1, got {num_workers}.",
+            )
+            return
+
+        # Validate details path before committing to running state
+        if self.save_details_var.get() and not self.details_file_path:
+            messagebox.showwarning(
+                "No details path",
+                "Please choose a details file path, or uncheck 'Save per-PDF details to file'.",
+            )
+            return
+
+        # Open details file before committing to running state so a bad path
+        # shows an error rather than silently writing nothing.
+        details_fh: IO[str] | None = None
+        if self.details_file_path:
+            try:
+                details_fh = open(  # noqa: SIM115
+                    self.details_file_path, "w", encoding="utf-8"
+                )
+            except OSError as e:
+                messagebox.showerror("Cannot write details file", str(e))
+                return
+
         self.stop_event.clear()
         self.is_running = True
         self.grand_total_pages = 0
         self.grand_total_pdfs = 0
         self.start_time = time.time()
+        self._details_fh = details_fh
 
         # Clear previous results
         for item in self.results_tree.get_children():
@@ -474,21 +565,16 @@ class PagesCounterApp(ctk.CTk):
         self.summary_var.set("")
         self.status_var.set("Processing...")
 
-        # Details file
-        details_path = self.details_file_path
-        if details_path:
-            init_details_file(details_path)
-
         # Launch background thread
         self.worker_thread = threading.Thread(
             target=_run_counting,
             args=(
                 self.files,
-                self.workers_var.get(),
-                details_path,
+                num_workers,
                 self.msg_queue,
                 self.stop_event,
                 self.mode,
+                self._pool_ref,
             ),
             daemon=True,
         )
@@ -528,6 +614,11 @@ class PagesCounterApp(ctk.CTk):
                 self.grand_total_pages += result.total_pages
                 self.grand_total_pdfs += result.pdf_count
 
+                row_tag = (
+                    "evenrow"
+                    if len(self.results_tree.get_children()) % 2 == 0
+                    else "oddrow"
+                )
                 self.results_tree.insert(
                     "",
                     "end",
@@ -537,8 +628,13 @@ class PagesCounterApp(ctk.CTk):
                         f"{result.total_pages:,}",
                         f"{elapsed:.1f}s",
                     ),
+                    tags=(row_tag,),
                 )
                 self.results_tree.see(self.results_tree.get_children()[-1])
+
+                # Write detail lines in the coordinator (single process, no race)
+                if self._details_fh is not None and result.detail_lines:
+                    self._details_fh.writelines(result.detail_lines)
 
                 # Update progress
                 done = len(self.results_tree.get_children())
@@ -554,6 +650,11 @@ class PagesCounterApp(ctk.CTk):
                 files_done: int = msg[1]
                 was_interrupted: bool = msg[2]
                 elapsed = time.time() - self.start_time
+
+                if self._details_fh is not None:
+                    self._details_fh.close()
+                    self._details_fh = None
+
                 self.is_running = False
                 self.btn_start.configure(state="normal")
                 self.btn_stop.configure(state="disabled")
@@ -562,7 +663,6 @@ class PagesCounterApp(ctk.CTk):
                 if was_interrupted:
                     self.status_var.set("Stopped by user.")
                 else:
-                    self.status_var.set("Done!")
                     self.summary_var.set(
                         f"Files: {files_done}  |  "
                         + f"PDFs: {self.grand_total_pdfs:,}  |  "
@@ -573,6 +673,8 @@ class PagesCounterApp(ctk.CTk):
                         self.status_var.set(
                             f"Done! Details saved to: {self.details_file_path}"
                         )
+                    else:
+                        self.status_var.set("Done!")
                 return
 
             elif msg_type == "error":
@@ -598,4 +700,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Required for multiprocessing in frozen (PyInstaller) builds on Windows,
+    # where workers are spawned by re-running this executable.
+    multiprocessing.freeze_support()
     main()

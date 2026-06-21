@@ -3,6 +3,7 @@ name = "pages-counter"
 version = "0.1.0"
 description = "Count pages in PDFs inside compressed tar archives without extracting to disk."
 readme = "README.md"
+license = "AGPL-3.0-or-later"
 requires-python = ">=3.13"
 dependencies = [
     "customtkinter>=5.2.0",

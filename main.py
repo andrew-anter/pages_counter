@@ -6,6 +6,7 @@ Run as GUI:  python main.py --gui
 
 from __future__ import annotations
 
+import multiprocessing
 import sys
 
 def main() -> None:
@@ -18,4 +19,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Required for multiprocessing in frozen (PyInstaller) builds on Windows,
+    # where workers are spawned by re-running this executable.
+    multiprocessing.freeze_support()
     main()
